@@ -1,183 +1,392 @@
  
-import pandas as pd
-import numpy as np
-
+from utils import FAKE_ITEM, unique
+from imblearn.over_sampling import SMOTENC
+from sklearn.preprocessing import StandardScaler
+from sklearn.metrics import classification_report
+from lightgbm import LGBMClassifier
+from implicit.nearest_neighbours import bm25_weight, tfidf_weight
+from implicit.nearest_neighbours import ItemItemRecommender
+from implicit.als import AlternatingLeastSquares
 from scipy.sparse import csr_matrix
 
-from implicit.als import AlternatingLeastSquares
-from implicit.nearest_neighbours import ItemItemRecommender
-from implicit.nearest_neighbours import bm25_weight, tfidf_weight
+import numpy as np
+import pandas as pd
+import warnings
+warnings.simplefilter(action='ignore', category=FutureWarning)
 
 
-class MainRecommender:
-    """Рекоммендации, которые можно получить из ALS
+class RecommenderDataset:
+    """Базовый класс для удобства работы с данными
     Input
     -----
-    user_item_matrix: pd.DataFrame
-        Матрица взаимодействий user-item
+    data: pd.DataFrame
+        DataFrame описывающий транзакции между user / item
+    values: str
+        поле по котором будет происходит агрегация и сортировка (сила взаимодействия user/item)
+        по умолчанию `weight`
+    aggfunc: str
+        способ агрегации поля values (по умолчанию `mean`)
+    weighting: str
+        способ взвешивания матрицы user_item (`bm25` или `tfidf`)
+        по умолчанию `bm25`
     """
 
-    def __init__(self, data, weighting=True):
+    def __init__(self, data, values='weight', aggfunc='count', weighting='bm25'):
 
-        # Топ покупок каждого юзера
-        self.top_purchases = data.groupby(['user_id', 'item_id'])['quantity'].count().reset_index()
-        self.top_purchases.sort_values('quantity', ascending=False, inplace=True)
-        self.top_purchases = self.top_purchases[self.top_purchases['item_id'] != 999999]
+        self.users_top = data[data['item_id'] != FAKE_ITEM].groupby(
+            ['user_id', 'item_id']).agg({values: aggfunc}).reset_index()
+        self.users_top.sort_values(values, ascending=False, inplace=True)
 
-        # Топ покупок по всему датасету
-        self.overall_top_purchases = data.groupby('item_id')['quantity'].count().reset_index()
-        self.overall_top_purchases.sort_values('quantity', ascending=False, inplace=True)
-        self.overall_top_purchases = self.overall_top_purchases[self.overall_top_purchases['item_id'] != 999999]
-        self.overall_top_purchases = self.overall_top_purchases.item_id.tolist()
+        self.top = data[data['item_id'] != FAKE_ITEM].groupby('item_id').agg({values: aggfunc}).reset_index()
+        self.top = self.top.sort_values(values, ascending=False).item_id.tolist()
 
-        self.user_item_matrix = self._prepare_matrix(data)  # pd.DataFrame
-        self.id_to_itemid, self.id_to_userid, \
-            self.itemid_to_id, self.userid_to_id = self._prepare_dicts(self.user_item_matrix)
+        user_item_matrix = pd.pivot_table(data, index='user_id', columns='item_id',
+                                          values=values, aggfunc=aggfunc,
+                                          fill_value=0).astype(float)
 
-        if weighting:
-            self.user_item_matrix = bm25_weight(self.user_item_matrix.T).T
+        self.userids = user_item_matrix.index.values
+        self.itemids = user_item_matrix.columns.values
+        matrix_userids = np.arange(len(self.userids))
+        matrix_itemids = np.arange(len(self.itemids))
 
-        self.model = self.fit(self.user_item_matrix)
-        self.own_recommender = self.fit_own_recommender(self.user_item_matrix)
+        self.id_to_itemid = dict(zip(matrix_itemids, self.itemids))
+        self.id_to_userid = dict(zip(matrix_userids, self.userids))
+        self.itemid_to_id = dict(zip(self.itemids, matrix_itemids))
+        self.userid_to_id = dict(zip(self.userids, matrix_userids))
 
-    @staticmethod
-    def _prepare_matrix(data):
-        """Готовит user-item матрицу"""
-        user_item_matrix = pd.pivot_table(data,
-                                          index='user_id', columns='item_id',
-                                          values='quantity',  # Можно пробовать другие варианты
-                                          aggfunc='count',
-                                          fill_value=0
-                                          )
+        self.FAKE_ITEM_ID = self.itemid_to_id[FAKE_ITEM]
+        self.__userTop = {}
 
-        user_item_matrix = user_item_matrix.astype(float)  # необходимый тип матрицы для implicit
+        if weighting == 'tfidf':
+            self.user_item_matrix = tfidf_weight(user_item_matrix.T).T
+        elif weighting == 'bm25':
+            self.user_item_matrix = bm25_weight(user_item_matrix.T).T
+        else:
+            self.user_item_matrix = user_item_matrix
 
-        return user_item_matrix
+        self.csr_matrix = csr_matrix(self.user_item_matrix).T.tocsr()
 
-    @staticmethod
-    def _prepare_dicts(user_item_matrix):
-        """Подготавливает вспомогательные словари"""
+    def userExist(self, userId):
+        return self.userid_to_id.get(userId, None) is not None
 
-        userids = user_item_matrix.index.values
-        itemids = user_item_matrix.columns.values
+    def userTop(self, userId, N=50):
+        if not self.userExist(userId):
+            return []
 
-        matrix_userids = np.arange(len(userids))
-        matrix_itemids = np.arange(len(itemids))
+        if self.__userTop.get(userId, None) is None:
+            self.__userTop[userId] = self.users_top[self.users_top.user_id == userId].head(200).item_id.tolist()
 
-        id_to_itemid = dict(zip(matrix_itemids, itemids))
-        id_to_userid = dict(zip(matrix_userids, userids))
+        return self.__userTop[userId][:N]
 
-        itemid_to_id = dict(zip(itemids, matrix_itemids))
-        userid_to_id = dict(zip(userids, matrix_userids))
+    def extend(self, res, N=5):
+        """дополняет результат до нужного количества из TOP товаров"""
+        res = unique(list(res))
 
-        return id_to_itemid, id_to_userid, itemid_to_id, userid_to_id
+        if len(res) < N:
+            res.extend(self.top[:N])
+            res = unique(res)
+            res = res[:N]
 
-    @staticmethod
-    def fit_own_recommender(user_item_matrix):
+        assert len(res) == N, f'Количество рекомендаций != {N}'
+        return res
+
+
+class BaseRecommender:
+    """Базовый класс для наследования
+       Модель, которая всегда рекомендует полулярные товары
+    Input
+    -----
+    ds: RecommenderDataset
+        подготовленный RecommenderDataset обьект
+    """
+
+    def __init__(self, ds):
+        # assert isinstance(ds, RecommenderDataset), 'Нужен обьект типа RecommenderDataset'
+        self.ds = ds
+
+    def fit(self):
+        return self
+
+    def extend(self, res, N=5, userId=None):
+        res = list(res)
+        if FAKE_ITEM in res:
+            res.remove(FAKE_ITEM)
+
+        if (len(res) < N) and (userId is not None):
+            res.extend(self.ds.userTop(userId, N))
+            res = unique(res)
+            res = res[:N]
+        return self.ds.extend(res, N)
+
+    def _recommend(self, userId=None, N=5):
+        return self.extend([], N=N, userId=userId)
+
+    def _similarItems(self, userId=None, N=5):
+        return self._recommend(userId, N)
+
+    def _similarUsers(self, userId=None, N=5):
+        return self._recommend(userId, N)
+
+    def recommend(self, users, N=5, by='model'):
+        if by == 'similarItems':
+            func = self._similarItems
+        elif by == 'similarUsers':
+            func = self._similarUsers
+        else:
+            func = self._recommend
+        return [func(user, N) for user in users]
+
+
+class OwnRecommender(BaseRecommender):
+    """Модель, которая рекомендует товары, среди товаров, купленных юзером
+    Input
+    -----
+    ds: RecommenderDataset
+        подготовленный RecommenderDataset обьект
+    """
+
+    def fit(self):
         """Обучает модель, которая рекомендует товары, среди товаров, купленных юзером"""
+        self.model = ItemItemRecommender(K=1, num_threads=4)
+        self.model.fit(self.ds.csr_matrix)
 
-        own_recommender = ItemItemRecommender(K=1, num_threads=4)
-        own_recommender.fit(csr_matrix(user_item_matrix).T.tocsr())
+        return self
 
-        return own_recommender
+    def _recommend(self, userId, N=5):
+        """Рекомендуем товары для пользователя обученной моделью"""
+        if not self.ds.userExist(userId):
+            return self.ds.extend([], N)
 
-    @staticmethod
-    def fit(user_item_matrix, n_factors=20, regularization=0.001, iterations=15, num_threads=4):
+        params = {
+            'userid': self.ds.userid_to_id[userId],
+            'user_items': self.ds.csr_matrix,
+            'N': N,
+            'filter_already_liked_items': False,
+            'filter_items': [self.ds.FAKE_ITEM_ID],
+            'recalculate_user': True
+        }
+
+        res = [
+            self.ds.id_to_itemid[rec[0]]
+            for rec in self.model.recommend(**params)
+        ]
+
+        return self.extend(res, N)
+
+
+class AlsRecommender(OwnRecommender):
+    """Модель, обученная ALS
+    Input
+    -----
+    ds: RecommenderDataset
+        подготовленный RecommenderDataset обьект
+    """
+
+    def fit(self, n_factors=20, regularization=0.001, iterations=15, num_threads=4):
         """Обучает ALS"""
+        self.model = AlternatingLeastSquares(factors=n_factors,
+                                             regularization=regularization,
+                                             iterations=iterations,
+                                             num_threads=num_threads)
+        self.model.fit(self.ds.csr_matrix)
 
-        model = AlternatingLeastSquares(factors=n_factors,
-                                        regularization=regularization,
-                                        iterations=iterations,
-                                        num_threads=num_threads)
-        model.fit(csr_matrix(user_item_matrix).T.tocsr())
+        return self
 
-        return model
-
-    def _get_rec(self, model, x):
-
-        recs = model.similar_items(self.itemid_to_id[x], N=2)
-        top_rec = recs[1][0]
-        return self.id_to_itemid[top_rec]
-
-    def _update_dict(self, user_id):
-        """Если появился новыю user / item, то нужно обновить словари"""
-
-        if user_id not in self.userid_to_id.keys():
-
-            max_id = max(list(self.userid_to_id.values()))
-            max_id += 1
-
-            self.userid_to_id.update({user_id: max_id})
-            self.id_to_userid.update({max_id: user_id})
-
-    def _get_similar_item(self, item_id):
-        """Находит товар, похожий на item_id"""
-        recs = self.model.similar_items(self.itemid_to_id[item_id], N=2)  # Товар похож на себя -> рекомендуем 2 товара
-        top_rec = recs[1][0]  # И берем второй (не товар из аргумента метода)
-        return self.id_to_itemid[top_rec]
-
-    def _extend_with_top_popular(self, recommendations, N=5):
-        """Если кол-во рекоммендаций < N, то дополняем их топ-популярными"""
-
-        if len(recommendations) < N:
-            recommendations.extend(self.overall_top_purchases[:N])
-            recommendations = recommendations[:N]
-
-        return recommendations
-
-    def _get_recommendations(self, user, model, N=5):
-        """Рекомендации через стардартные библиотеки implicit"""
-
-        self._update_dict(user_id=user)
-        res = [self.id_to_itemid[rec[0]] for rec in model.recommend(userid=self.userid_to_id[user],
-                                        user_items=csr_matrix(self.user_item_matrix).tocsr(),
-                                        N=N,
-                                        filter_already_liked_items=False,
-                                        # filter_items=[self.itemid_to_id[999999]],
-                                        recalculate_user=False)]
-
-        res = self._extend_with_top_popular(res, N=N)
-
-        assert len(res) == N, 'Количество рекомендаций != {}'.format(N)
-        return res
-
-    def get_als_recommendations(self, user, N=5):
-        """Рекомендации через стардартные библиотеки implicit"""
-
-        self._update_dict(user_id=user)
-        return self._get_recommendations(user, model=self.model, N=N)
-
-    def get_own_recommendations(self, user, N=5):
-        """Рекомендуем товары среди тех, которые юзер уже купил"""
-
-        self._update_dict(user_id=user)
-        return self._get_recommendations(user, model=self.own_recommender, N=N)
-
-    def get_similar_items_recommendation(self, user, N=5):
+    def _similarItems(self, userId, N=5):
         """Рекомендуем товары, похожие на топ-N купленных юзером товаров"""
+        if not self.ds.userExist(userId):
+            return self.ds.extend([], N)
 
-        top_users_purchases = self.top_purchases[self.top_purchases['user_id'] == user].head(N)
+        def _get_similar_item(item_id):
+            """Находит товар, похожий на item_id"""
+            recs = self.model.similar_items(self.ds.itemid_to_id[item_id], N=2)
+            if len(recs) > 1:
+                top_rec = recs[1][0]
+                return self.ds.id_to_itemid[top_rec]
+            return item_id
 
-        res = top_users_purchases['item_id'].apply(lambda x: self._get_similar_item(x)).tolist()
-        res = self._extend_with_top_popular(res, N=N)
+        res = [_get_similar_item(item) for item in self.ds.userTop(userId, N)]
+        return self.extend(res, N)
 
-        assert len(res) == N, 'Количество рекомендаций != {}'.format(N)
-        return res
-
-    def get_similar_users_recommendation(self, user, N=5):
+    def _similarUsers(self, userId, N=5):
         """Рекомендуем топ-N товаров, среди купленных похожими юзерами"""
+        if not self.ds.userExist(userId):
+            return self.ds.extend([], N)
 
         res = []
-
-        # Находим топ-N похожих пользователей
-        similar_users = self.model.similar_users(self.userid_to_id[user], N=N+1)
-        similar_users = [rec[0] for rec in similar_users]
-        similar_users = similar_users[1:]   # удалим юзера из запроса
+        similar_users = [rec[0] for rec in self.model.similar_users(self.ds.userid_to_id[userId], N=N+1)]
+        similar_users = similar_users[1:]
 
         for user in similar_users:
-            res.extend(self.get_own_recommendations(user, N=1))
+            res.extend(self.ds.userTop(userId, 1))
 
-        res = self._extend_with_top_popular(res, N=N)
+        return self.extend(res, N)
 
-        assert len(res) == N, 'Количество рекомендаций != {}'.format(N)
-        return res
+    def items_embedings(self):
+        emb = pd.DataFrame(data=self.model.item_factors).add_prefix('itm')
+        emb['item_id'] = self.ds.itemids
+        return emb
+
+    def users_embedings(self):
+        emb = pd.DataFrame(data=self.model.user_factors).add_prefix('usr')
+        emb['user_id'] = self.ds.userids
+        return emb
+
+
+class Level2Recommender():
+    """Модель ранжирования кандидатов на основе LGBMClassifier
+    Input
+    -----
+        transactions: взаимодействия users vs items
+        items: фичи items
+        users: фичи users
+    """
+
+    def __init__(self, transactions, items=None, users=None, items_emb=None, users_emb=None):
+        self._set_items(transactions, items, items_emb)
+        self._set_users(transactions, users, users_emb)
+        self.fitDone = False
+
+    def _set_items(self, data, items=None, ie=None):
+        istat = data.groupby('item_id').agg({
+            'store_id': 'std',
+            'basket_id': 'std',
+            'sales_value': 'std',
+            'quantity': 'std',
+            'day': 'std',
+        }).reset_index().add_prefix('i_')
+
+        item_id = istat.i_item_id
+        istat = 1/istat
+        istat['item_id'] = item_id
+        self.items = istat.drop('i_item_id', axis=1).replace([np.inf, -np.inf], np.nan).fillna(0)
+
+        if items is not None:
+            self.items = self.items.merge(items, how='left', on='item_id')
+        if ie is not None:
+            item_features = self.items.merge(ie, how='outer', on='item_id')
+            le = ie.shape[1]-1
+            lx = len(item_features[item_features['itm0'].isnull()])
+            embs = [list(ie[ie['item_id'] == 9999999].iloc[:, :-1].values[0])] * lx
+            item_features.loc[item_features['itm0'].isnull(), -le:] = embs
+            self.items = item_features
+
+    def _set_users(self, data, users=None, ue=None):
+        stat = data.groupby('user_id').agg({
+            'store_id': 'nunique',
+            'basket_id': 'nunique',
+            'sales_value': 'mean',
+            'quantity': 'mean',
+            'coupon_disc': 'mean',
+            'retail_disc': 'mean',
+            'coupon_match_disc': 'mean',
+            'trans_time': 'mean',
+            'day': 'max',
+        }).reset_index()
+
+        stat['store_id'] /= data['store_id'].nunique()
+        stat['basket_id'] /= data['basket_id'].nunique()
+        stat['day'] /= data['day'].max()
+        stat['trans_time'] /= data['trans_time'].max()
+        self.users = stat.replace([np.inf, -np.inf], np.nan).fillna(0)
+
+        if users is not None:
+            self.users = self.users.merge(users, how='left', on='user_id')
+        if ue is not None:
+            self.users = self.users.merge(ue, how='outer', on='user_id')
+
+    def _prepare_features(self, data):
+        data = data[['user_id', 'item_id']]
+
+        if self.items is not None:
+            data = data.merge(self.items, how='left', on='item_id')
+
+        if self.users is not None:
+            data = data.merge(self.users, how='left', on='user_id')
+
+        nll = data.isnull().sum()
+        nll = nll[nll > 0]
+        for i in nll.index:
+            tp = str(data[i].dtype)
+            vl = data[i].mode()[0] if tp == 'category' else data[i].mean()
+            data[i].fillna(vl, inplace=True)
+
+        return data
+
+    def fit_predict_report(self, df):
+        le = len(df) // 3
+        tmp = df.sample(frac=1)
+        train_set, test_set = tmp[:-le], tmp[-le:]
+
+        X = train_set[['user_id', 'item_id']]
+        y = train_set['target']
+        self.fit(X, y)
+        y_pred = self.predict(X)
+        print("Качество на TRAIN:")
+        print(classification_report(y, y_pred))
+
+        X = test_set[['user_id', 'item_id']]
+        y = test_set['target']
+        y_pred = self.predict(X)
+        print("Качество на TEST:")
+        print(classification_report(y, y_pred))
+
+    def fit(self, X, y, **kwargs):
+        self.fitDone = False
+
+        print('Fitting ...', end='')
+        X = self._prepare_features(X)
+        self.nums = X.dtypes[X.dtypes == float].index.tolist()
+        self.cats = X.dtypes[X.dtypes == 'category'].index.tolist()
+        self.cols = self.nums + self.cats
+
+        # Скейлим числовые признаки
+        self.sc = StandardScaler()
+        X[self.nums] = self.sc.fit_transform(X[self.nums])
+
+        # Убираем дисбаланс классов
+        # cf = [X[self.cols].dtypes == 'category']
+        # X, y = SMOTENC(random_state=42, sampling_strategy=0.3,
+        #                categorical_features=cf).fit_resample(X[self.cols], y)
+        X = pd.DataFrame(X, columns=self.cols)
+        X[self.cats] = X[self.cats].astype('category')
+        X[self.nums] = X[self.nums].astype(float)
+
+        self.model = LGBMClassifier(objective='binary', n_estimators=300, reg_lambda=2, random_state=42)
+        self.model.fit(X, y)
+        print('done')
+        self.fitDone = True
+        return self
+
+    def predict(self, X):
+        if not self.fitDone:
+            raise Exception('Fit is not done')
+        X = self._prepare_features(X)
+        X[self.nums] = self.sc.transform(X[self.nums])
+        return self.model.predict(X[self.cols])
+
+    def predict_proba(self, X):
+        if not self.fitDone:
+            raise Exception('Fit is not done')
+        X = self._prepare_features(X)
+        X[self.nums] = self.sc.transform(X[self.nums])
+        return self.model.predict_proba(X[self.cols])[:, 0]
+
+    def recommend(self, df, N=50):
+        X = df[['user_id', 'item_id']].copy()
+        X['predict'] = self.predict_proba(X)
+        X = X.sort_values('predict', ascending=False).groupby('user_id')['item_id'].unique().reset_index()
+        X['recommend_level2'] = X['item_id'].apply(lambda x: list(x)[:N])
+        return X[['user_id', 'recommend_level2']]
+
+    # def recommend(self, df, N=50):
+    #     res = df.groupby('user_id')['item_id'].unique().reset_index()
+    #     res.columns = ['user_id', 'actual']
+
+    #     X = df[['user_id', 'item_id']].copy()
+    #     X['predict'] = self.predict_proba(X)
+    #     X = X.sort_values('predict', ascending=False).groupby('user_id')['item_id'].unique().reset_index()
+    #     X['actual'] = X['actual'].apply(lambda x: list(x))
+    #     X['recommend_level2'] = X['item_id'].apply(lambda x: list(x)[:N])
+
+    #     return res.merge(X[['user_id', 'predict']], how='left', on='user_id')
